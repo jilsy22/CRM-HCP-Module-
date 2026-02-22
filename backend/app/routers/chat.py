@@ -1,6 +1,6 @@
-import asyncio
 import json
 import uuid
+import traceback
 from typing import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -51,6 +51,7 @@ async def chat(request: ChatMessageRequest, db: AsyncSession = Depends(get_db)):
             tool_calls=tool_calls_info,
         )
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
 
@@ -60,7 +61,13 @@ async def chat_stream(request: ChatMessageRequest, db: AsyncSession = Depends(ge
     Server-Sent Events (SSE) streaming chat endpoint.
     Streams tokens and tool call events back to the client in real time.
     """
-    agent = create_agent(db)
+    # Create agent BEFORE entering the generator so errors surface immediately
+    try:
+        agent = create_agent(db)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to create agent: {str(e)}")
+
     config = {"configurable": {"thread_id": request.session_id}}
 
     async def event_generator() -> AsyncIterator[str]:
@@ -93,13 +100,14 @@ async def chat_stream(request: ChatMessageRequest, db: AsyncSession = Depends(ge
                     payload = json.dumps({
                         "type": "tool_end",
                         "tool": name,
-                        "output": str(output)[:500],  # truncate long outputs
+                        "output": str(output)[:600],
                     })
                     yield f"data: {payload}\n\n"
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         except Exception as e:
+            traceback.print_exc()
             error_payload = json.dumps({"type": "error", "content": str(e)})
             yield f"data: {error_payload}\n\n"
 

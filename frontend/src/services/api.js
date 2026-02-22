@@ -25,11 +25,26 @@ export const newChatSession = () => api.get('/chat/new-session');
 export const streamChatMessage = (data, onToken, onToolEvent, onDone, onError) => {
     const url = '/api/chat/stream';
 
+    // Guard: ensure onDone is called at most once
+    let doneSignaled = false;
+    const signalDone = () => {
+        if (!doneSignaled) {
+            doneSignaled = true;
+            onDone();
+        }
+    };
+
     fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
     }).then(async (response) => {
+        if (!response.ok) {
+            const text = await response.text();
+            onError(`Server error ${response.status}: ${text}`);
+            return;
+        }
+
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -45,17 +60,27 @@ export const streamChatMessage = (data, onToken, onToolEvent, onDone, onError) =
             for (const line of lines) {
                 if (line.startsWith('data: ')) {
                     try {
-                        const event = JSON.parse(line.replace('data: ', ''));
-                        if (event.type === 'token') onToken(event.content);
-                        else if (event.type === 'tool_start' || event.type === 'tool_end') onToolEvent(event);
-                        else if (event.type === 'done') onDone();
-                        else if (event.type === 'error') onError(event.content);
+                        const event = JSON.parse(line.slice(6)); // remove 'data: ' prefix
+                        if (event.type === 'token') {
+                            onToken(event.content);
+                        } else if (event.type === 'tool_start' || event.type === 'tool_end') {
+                            onToolEvent(event);
+                        } else if (event.type === 'done') {
+                            signalDone();
+                        } else if (event.type === 'error') {
+                            onError(event.content);
+                            signalDone();
+                        }
                     } catch (e) { /* skip malformed */ }
                 }
             }
         }
-        onDone();
-    }).catch(onError);
+        // Stream ended naturally — ensure done is signaled
+        signalDone();
+    }).catch((err) => {
+        onError(err.message || 'Network error');
+        signalDone();
+    });
 };
 
 export default api;

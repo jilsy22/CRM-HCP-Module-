@@ -15,17 +15,28 @@ const TOOL_LABELS = {
 };
 
 const EXAMPLE_PROMPTS = [
-    "Log my meeting with Dr. Priya Sharma today about Metformin XR — very positive, she agreed to prescribe",
+    "Log my meeting with Dr. Priya Sharma today about Metformin XR - very positive, she agreed to prescribe",
     "Show me interaction history for Dr. Arjun Mehta",
     "Search for Cardiologists in the North territory",
     "What should I do next with Dr. Sneha Reddy?",
-    "Edit interaction 1 — add next step: send follow-up brochure by Friday",
+    "Edit interaction 1 - add next step: send follow-up brochure by Friday",
 ];
+
+/** Render text preserving newlines as <br> elements */
+function FormattedText({ text }) {
+    if (!text) return null;
+    return (
+        <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {text}
+        </span>
+    );
+}
 
 export default function ChatInterface({ compact = false }) {
     const dispatch = useDispatch();
     const { messages, loading, streamingContent, activeToolCalls, sessionId } = useSelector(s => s.chat);
     const [input, setInput] = useState('');
+    const [errorMsg, setErrorMsg] = useState(null);
     const messagesEndRef = useRef(null);
     const textareaRef = useRef(null);
 
@@ -37,6 +48,7 @@ export default function ChatInterface({ compact = false }) {
         const msg = text || input.trim();
         if (!msg || loading) return;
         setInput('');
+        setErrorMsg(null);
 
         dispatch(addUserMessage(msg));
         dispatch(startAIMessage());
@@ -48,6 +60,7 @@ export default function ChatInterface({ compact = false }) {
             () => dispatch(finalizeAIMessage()),
             (err) => {
                 console.error('Stream error:', err);
+                setErrorMsg(typeof err === 'string' ? err : 'Something went wrong. Please try again.');
                 dispatch(setLoading(false));
                 dispatch(finalizeAIMessage());
             }
@@ -70,7 +83,7 @@ export default function ChatInterface({ compact = false }) {
                 </div>
                 <div className="chat-bubble-content">
                     <div className={`chat-bubble-text ${isUser ? 'bubble-user' : 'bubble-ai'}`}>
-                        {msg.content}
+                        <FormattedText text={msg.content} />
                     </div>
                     {/* Tool calls summary */}
                     {msg.toolCalls && msg.toolCalls.length > 0 && (
@@ -157,7 +170,7 @@ export default function ChatInterface({ compact = false }) {
                         <div className="chat-bubble-avatar avatar-ai">🤖</div>
                         <div className="chat-bubble-content">
                             <div className="chat-bubble-text bubble-ai">
-                                {streamingContent}
+                                <FormattedText text={streamingContent} />
                                 <span style={{ display: 'inline-block', width: 2, height: '1em', background: 'var(--accent-primary)', marginLeft: 2, animation: 'pulse 0.8s infinite', verticalAlign: 'text-bottom' }} />
                             </div>
                         </div>
@@ -173,6 +186,18 @@ export default function ChatInterface({ compact = false }) {
                                 <div className="typing-dots">
                                     <span /><span /><span />
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Error bubble */}
+                {errorMsg && (
+                    <div className="chat-bubble">
+                        <div className="chat-bubble-avatar" style={{ background: '#ef444422', color: '#ef4444' }}>⚠️</div>
+                        <div className="chat-bubble-content">
+                            <div className="chat-bubble-text" style={{ background: '#ef444415', border: '1px solid #ef444440', color: '#ef4444', borderRadius: 'var(--radius-lg)', padding: 'var(--space-3) var(--space-4)' }}>
+                                <strong>Error:</strong> {errorMsg}
                             </div>
                         </div>
                     </div>
@@ -204,7 +229,7 @@ export default function ChatInterface({ compact = false }) {
                 >
                     {loading
                         ? <span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
-                        : compact ? '⚡ Log' : '↑'
+                        : compact ? '⚡ Send' : '↑'
                     }
                 </button>
             </div>
@@ -212,9 +237,9 @@ export default function ChatInterface({ compact = false }) {
             {/* Footer */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0 var(--space-4) var(--space-3)', borderTop: '1px solid var(--border-default)' }}>
                 <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
-                    Powered by LangGraph · Groq gemma2-9b-it
+                    Powered by LangGraph · Groq llama-3.1-8b-instant
                 </span>
-                <button className="btn btn-ghost btn-sm" id="reset-chat-btn" onClick={() => dispatch(resetChat())}>
+                <button className="btn btn-ghost btn-sm" id="reset-chat-btn" onClick={() => { dispatch(resetChat()); setErrorMsg(null); }}>
                     New Chat
                 </button>
             </div>

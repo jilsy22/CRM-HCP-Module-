@@ -10,6 +10,7 @@ Five tools:
 """
 
 import json
+import re
 from datetime import datetime
 from typing import Optional
 from langchain_core.tools import tool
@@ -23,6 +24,26 @@ def set_dependencies(db_session, llm):
     global _db_session, _llm
     _db_session = db_session
     _llm = llm
+
+
+def _extract_json(text: str) -> dict:
+    """
+    Robustly extract a JSON object from LLM output.
+    Handles:
+      - Plain JSON strings
+      - JSON wrapped in markdown code fences (```json ... ```)
+      - Leading/trailing whitespace
+    """
+    text = text.strip()
+    # Strip markdown code fences if present
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    # Find first { ... } block
+    brace_match = re.search(r"\{[\s\S]*\}", text)
+    if brace_match:
+        text = brace_match.group(0)
+    return json.loads(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +66,7 @@ async def log_interaction(
 
     Args:
         hcp_name: Full name of the HCP (used to lookup in DB)
-        interaction_type: Type such as 'In-Person Visit', 'Phone Call', 'Email', etc.
+        interaction_type: Type such as 'In-Person Visit', 'Phone Call', 'Email', 'Webinar', 'Conference'
         notes: Raw notes from the interaction (free text)
         products_discussed: Comma-separated product names (optional, LLM will also extract)
         location: Physical location or platform used
@@ -64,7 +85,10 @@ async def log_interaction(
     hcp = result.scalars().first()
 
     if not hcp:
-        return f"❌ HCP '{hcp_name}' not found in the database. Please search for the correct HCP name first."
+        return (
+            f"❌ HCP '{hcp_name}' not found in the database.\n"
+            f"Tip: Use search_hcp to find the correct name first."
+        )
 
     # 2. Use LLM to enrich the raw notes
     enrichment_prompt = f"""You are an AI assistant for a pharmaceutical field representative CRM system.
@@ -84,21 +108,20 @@ Extract and return a JSON object with exactly these keys:
 - "next_steps": A brief description of recommended next steps
 - "samples_provided": A list of samples given to the HCP (if any)
 
-Return ONLY valid JSON, no markdown, no explanation."""
+Return ONLY valid JSON with no markdown formatting, no code fences, no explanation."""
 
     llm_response = await llm.ainvoke(enrichment_prompt)
-    
+
     try:
-        enriched = json.loads(llm_response.content)
-    except json.JSONDecodeError:
-        # Fallback if LLM returns non-JSON
+        enriched = _extract_json(llm_response.content)
+    except (json.JSONDecodeError, ValueError):
         enriched = {
             "summary": notes[:300],
             "sentiment": "neutral",
             "sentiment_score": 0.0,
             "products_discussed": [],
             "objections_raised": [],
-            "next_steps": "",
+            "next_steps": "Follow up with HCP as appropriate.",
             "samples_provided": [],
         }
 
@@ -138,6 +161,9 @@ Return ONLY valid JSON, no markdown, no explanation."""
     await db.commit()
     await db.refresh(interaction)
 
+    products_str = ", ".join(enriched.get("products_discussed", [])) or "None"
+    objections_str = ", ".join(enriched.get("objections_raised", [])) or "None"
+
     return (
         f"✅ Interaction logged successfully!\n"
         f"  - ID: {interaction.id}\n"
@@ -145,7 +171,8 @@ Return ONLY valid JSON, no markdown, no explanation."""
         f"  - Type: {mapped_type.value}\n"
         f"  - Sentiment: {enriched.get('sentiment', 'neutral')} (score: {enriched.get('sentiment_score', 0.0):.2f})\n"
         f"  - Summary: {enriched.get('summary', '')}\n"
-        f"  - Products: {', '.join(enriched.get('products_discussed', [])) or 'None'}\n"
+        f"  - Products: {products_str}\n"
+        f"  - Objections: {objections_str}\n"
         f"  - Next Steps: {enriched.get('next_steps', 'None')}"
     )
 
@@ -167,6 +194,7 @@ async def edit_interaction(
     """
     Edit / update an existing logged HCP interaction by its ID.
     Only provide the fields you want to change — others remain unchanged.
+    If raw_notes are updated, the AI automatically re-generates the summary and sentiment.
 
     Args:
         interaction_id: The numeric ID of the interaction to edit
@@ -201,21 +229,22 @@ Re-analyze the following updated interaction notes.
 
 Raw Notes: {raw_notes}
 
-Return a JSON with:
+Return a JSON object with exactly these keys:
 - "summary": 2-3 sentence professional summary
 - "sentiment": "positive", "neutral", or "negative"
 - "sentiment_score": float between -1.0 and 1.0
 
-Return ONLY valid JSON."""
+Return ONLY valid JSON with no markdown formatting and no code fences."""
+
         llm_response = await llm.ainvoke(re_enrich_prompt)
         try:
-            enriched = json.loads(llm_response.content)
+            enriched = _extract_json(llm_response.content)
             interaction.ai_summary = enriched.get("summary", interaction.ai_summary)
             interaction.sentiment = enriched.get("sentiment", interaction.sentiment)
             interaction.sentiment_score = enriched.get("sentiment_score", interaction.sentiment_score)
-            updates.append("ai_summary, sentiment")
-        except json.JSONDecodeError:
-            pass
+            updates.append("ai_summary + sentiment")
+        except (json.JSONDecodeError, ValueError):
+            pass  # Keep existing summary if LLM fails
 
     if next_steps is not None:
         interaction.next_steps = next_steps
@@ -248,7 +277,8 @@ Return ONLY valid JSON."""
             f"✅ Interaction #{interaction_id} updated successfully!\n"
             f"  - Fields changed: {', '.join(updates)}\n"
             f"  - Updated summary: {interaction.ai_summary or 'N/A'}\n"
-            f"  - Sentiment: {interaction.sentiment or 'N/A'}"
+            f"  - Sentiment: {interaction.sentiment or 'N/A'}\n"
+            f"  - Next Steps: {interaction.next_steps or 'N/A'}"
         )
     else:
         return f"ℹ️ No fields were provided to update for Interaction #{interaction_id}."
@@ -269,11 +299,12 @@ async def search_hcp(
     Search for Healthcare Professionals (HCPs) in the database.
     You can search by name, specialty, territory, or institution.
     At least one search parameter must be provided.
+    Returns HCP IDs that can be used in other tools.
 
     Args:
         name: Partial name of the HCP (case-insensitive)
         specialty: Medical specialty (e.g., 'Cardiology', 'Oncology')
-        territory: Sales territory name (e.g., 'North', 'South East')
+        territory: Sales territory name (e.g., 'North', 'South')
         institution: Hospital or clinic name
     """
     from sqlalchemy import select, or_
@@ -300,14 +331,16 @@ async def search_hcp(
     hcps = result.scalars().all()
 
     if not hcps:
-        return f"🔍 No HCPs found matching the given criteria."
+        return "🔍 No HCPs found matching the given criteria."
 
     lines = [f"🔍 Found {len(hcps)} HCP(s):\n"]
     for hcp in hcps:
         lines.append(
-            f"  • ID: {hcp.id} | {hcp.name} | {hcp.specialty} | "
-            f"Territory: {hcp.territory or 'N/A'} | Institution: {hcp.institution or 'N/A'}"
+            f"  • [ID: {hcp.id}] {hcp.name}\n"
+            f"    Specialty: {hcp.specialty} | Territory: {hcp.territory or 'N/A'}\n"
+            f"    Institution: {hcp.institution or 'N/A'} | Phone: {hcp.phone or 'N/A'}"
         )
+    lines.append("\nYou can use the ID or name in log_interaction, get_interaction_history, or generate_next_best_action.")
     return "\n".join(lines)
 
 
@@ -331,7 +364,6 @@ async def get_interaction_history(
         limit: Maximum number of recent interactions to return (default 5)
     """
     from sqlalchemy import select
-    from sqlalchemy.orm import selectinload
     from ..models import HCP, Interaction
 
     if not hcp_name and not hcp_id:
@@ -347,7 +379,7 @@ async def get_interaction_history(
 
     hcp = result.scalars().first()
     if not hcp:
-        return f"❌ HCP not found with the given criteria."
+        return "❌ HCP not found with the given criteria."
 
     # Get interactions
     result = await db.execute(
@@ -363,11 +395,22 @@ async def get_interaction_history(
 
     lines = [f"📋 Last {len(interactions)} interaction(s) with {hcp.name} ({hcp.specialty}):\n"]
     for ix in interactions:
+        itype = ix.interaction_type.value if ix.interaction_type else "Unknown"
+        idate = ix.interaction_date.strftime("%Y-%m-%d") if ix.interaction_date else "N/A"
+        products = ", ".join(ix.products_discussed or []) or "None"
+        objections = ", ".join(ix.objections_raised or []) or "None"
         lines.append(
-            f"  ─ ID: {ix.id} | {ix.interaction_type.value} on "
-            f"{ix.interaction_date.strftime('%Y-%m-%d') if ix.interaction_date else 'N/A'}\n"
-            f"    Sentiment: {ix.sentiment or 'N/A'} | "
-            f"Products: {', '.join(ix.products_discussed or []) or 'None'}\n"
+            f"  ─ [ID: {ix.id}] {itype} on {idate}\n"
+            f"    Sentiment: {ix.sentiment or 'N/A'} (score: {ix.sentiment_score:.2f})\n"
+            f"    Products: {products}\n"
+            f"    Objections: {objections}\n"
+            f"    Summary: {ix.ai_summary or ix.raw_notes or 'No notes'}\n"
+            f"    Next Steps: {ix.next_steps or 'None'}"
+        ) if ix.sentiment_score is not None else lines.append(
+            f"  ─ [ID: {ix.id}] {itype} on {idate}\n"
+            f"    Sentiment: {ix.sentiment or 'N/A'}\n"
+            f"    Products: {products}\n"
+            f"    Objections: {objections}\n"
             f"    Summary: {ix.ai_summary or ix.raw_notes or 'No notes'}\n"
             f"    Next Steps: {ix.next_steps or 'None'}"
         )
@@ -386,6 +429,7 @@ async def generate_next_best_action(
     """
     Analyze the interaction history for an HCP and use the LLM to generate
     intelligent, personalized next best action recommendations for the field rep.
+    This tool reads the full history and provides a prioritized action plan.
 
     Args:
         hcp_name: Name of the HCP (partial match supported)
@@ -408,7 +452,7 @@ async def generate_next_best_action(
 
     hcp = result.scalars().first()
     if not hcp:
-        return f"❌ HCP not found."
+        return "❌ HCP not found."
 
     # Get recent interactions
     result = await db.execute(
@@ -421,16 +465,23 @@ async def generate_next_best_action(
 
     if not interactions:
         return (
-            f"ℹ️ No interaction history for {hcp.name}. "
-            f"Recommendation: Schedule an introductory visit to establish rapport."
+            f"ℹ️ No interaction history found for {hcp.name} ({hcp.specialty}) at {hcp.institution or 'N/A'}.\n\n"
+            f"🎯 Recommendation: Schedule an introductory in-person visit to:\n"
+            f"  1. Introduce yourself and your product portfolio\n"
+            f"  2. Learn about the HCP's current treatment approach\n"
+            f"  3. Leave relevant clinical materials\n"
+            f"  4. Set up a follow-up call within 2 weeks"
         )
 
     # Prepare context for LLM
     history_text = "\n".join([
         f"- [{ix.interaction_date.strftime('%Y-%m-%d') if ix.interaction_date else 'N/A'}] "
-        f"{ix.interaction_type.value}: {ix.ai_summary or ix.raw_notes or 'No notes'} | "
-        f"Sentiment: {ix.sentiment} | Products: {', '.join(ix.products_discussed or [])} | "
-        f"Objections: {', '.join(ix.objections_raised or [])} | Next Steps: {ix.next_steps or 'None'}"
+        f"{ix.interaction_type.value if ix.interaction_type else 'Unknown'}: "
+        f"{ix.ai_summary or ix.raw_notes or 'No notes'} | "
+        f"Sentiment: {ix.sentiment or 'unknown'} | "
+        f"Products: {', '.join(ix.products_discussed or []) or 'None'} | "
+        f"Objections: {', '.join(ix.objections_raised or []) or 'None'} | "
+        f"Next Steps: {ix.next_steps or 'None'}"
         for ix in interactions
     ])
 
@@ -445,15 +496,15 @@ HCP Profile:
 Recent Interaction History:
 {history_text}
 
-Based on this history, provide a concise, actionable Next Best Action plan for the field rep.
-Include:
+Based on this history, provide a concise, actionable Next Best Action plan.
+Format your response as a numbered list with exactly these 5 sections:
 1. Recommended immediate action (within 1 week)
 2. Key talking points for the next visit
 3. Products to focus on and why
-4. How to address any prior objections
+4. How to address prior objections
 5. Long-term relationship strategy (1-3 months)
 
-Be specific, practical, and empathetic to the HCP's needs. Format as a clear numbered list."""
+Be specific, practical, and empathetic to the HCP's needs."""
 
     llm_response = await llm.ainvoke(nba_prompt)
 
